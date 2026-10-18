@@ -31,7 +31,21 @@ import {
   User,
   Video,
   X,
+  Lock,
+  Timer,
+  Eye,
 } from "lucide-react";
+import {
+  DISAPPEAR_OPTIONS,
+  consumeViewOnce,
+  decryptText,
+  defaultPrivacy,
+  encryptText,
+  ensureMyKeys,
+  setDisappearTimer,
+  setSecretChat,
+  subscribePrivacy,
+} from "./privacy";
 
 import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
 import { db, secureUrl, uploadToCloudinary } from "../../lib/firebase";
@@ -45,6 +59,7 @@ import {
   deleteForEveryone,
   deleteForMe,
   editMessage,
+  hardDeleteMessage,
   markDelivered,
   markSeen,
   sendMessage,
@@ -137,6 +152,10 @@ export function ChatView({
   const [editDraft, setEditDraft] = useState("");
   const [quickReaction, setQuickReaction] = useState(DEFAULT_QUICK_REACTION);
   const [quickOpen, setQuickOpen] = useState(false);
+  const [privacy, setPrivacy] = useState(defaultPrivacy);
+  const [decrypted, setDecrypted] = useState<Record<string, string>>({});
+  const [viewOnce, setViewOnce] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
 
 
   useEffect(() => {
@@ -179,6 +198,10 @@ export function ChatView({
             deletedFor: data.deletedFor ?? [],
             deleted: Boolean(data.deleted),
             reactions: data.reactions ?? {},
+            enc: data.enc && data.enc.ct ? data.enc : undefined,
+            expiresAt: typeof data.expiresAt === "number" ? data.expiresAt : 0,
+            viewOnce: Boolean(data.viewOnce),
+            viewOnceOpened: Boolean(data.viewOnceOpened),
           } as ChatMessage;
         }),
       );
@@ -199,10 +222,68 @@ export function ChatView({
     void markDelivered(user.uid, other.uid);
   }, [user, other.uid]);
 
+  // Privacy settings (secret chat / disappearing timer) for this conversation.
+  useEffect(() => {
+    if (!user) return;
+    void ensureMyKeys(user.uid).catch(() => undefined);
+    return subscribePrivacy(conversationId(user.uid, other.uid), setPrivacy);
+  }, [user, other.uid]);
+
+  // Decrypt end-to-end encrypted messages on this device.
+  useEffect(() => {
+    if (!user) return;
+    const pending = messages.filter((m) => m.enc && decrypted[m.id] === undefined);
+    if (pending.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      const next: Record<string, string> = {};
+      for (const m of pending) {
+        try {
+          next[m.id] = await decryptText(user.uid, other.uid, m.enc!);
+        } catch {
+          next[m.id] = "🔒 Encrypted message (can't be read on this device)";
+        }
+      }
+      if (!cancelled) setDecrypted((prev) => ({ ...prev, ...next }));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [messages, user, other.uid, decrypted]);
+
+  // Clock for disappearing messages + remove expired ones.
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 15000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    if (!user) return;
+    messages
+      .filter((m) => m.expiresAt && m.expiresAt <= now)
+      .forEach((m) => void hardDeleteMessage(user.uid, other.uid, m.id).catch(() => undefined));
+  }, [messages, now, user, other.uid]);
+
   const visible = useMemo(
-    () => messages.filter((m) => !m.deletedFor.includes(user?.uid ?? "")),
-    [messages, user],
+    () =>
+      messages
+        .filter((m) => !m.deletedFor.includes(user?.uid ?? ""))
+        .filter((m) => !m.expiresAt || m.expiresAt > now)
+        .map((m) => (m.enc ? { ...m, text: decrypted[m.id] ?? "🔒 Decrypting…" } : m)),
+    [messages, user, now, decrypted],
   );
+
+  /** Builds encrypted text + privacy fields for an outgoing message. */
+  const privacyPayload = async (value: string, opts?: { viewOnce?: boolean }) => {
+    const extra: Record<string, unknown> = {};
+    let outText = value;
+    if (privacy.secret && value && user) {
+      extra["enc"] = await encryptText(user.uid, other.uid, value);
+      outText = "";
+    }
+    if (privacy.disappearMs > 0) extra["expiresAt"] = Date.now() + privacy.disappearMs;
+    if (opts?.viewOnce) extra["viewOnce"] = true;
+    return { outText, extra };
+  };
 
   /** Reset scroll anchoring when switching to a different conversation. */
   useEffect(() => {
@@ -294,11 +375,17 @@ export function ChatView({
         type: blob.type || "audio/webm",
       });
       const uploaded = await withRetry(() => uploadToCloudinary(voice));
-      await sendMessage(user.uid, other.uid, "", {
-        url: uploaded.url,
-        type: "audio",
-        name: "Voice message",
-      });
+      const { extra } = await privacyPayload("");
+      await sendMessage(
+        user.uid,
+        other.uid,
+        "",
+        { url: uploaded.url, type: "audio", name: "Voice message" },
+        "text",
+        undefined,
+        undefined,
+        extra,
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not send voice");
     } finally {
@@ -435,6 +522,8 @@ export function ChatView({
     }
     const value = text.trim();
     const chosen = file;
+    const sendViewOnce = viewOnce && !!chosen?.type.startsWith("image/");
+    setViewOnce(false);
     const quoted = replyTo;
     const reply = quoted
       ? {
@@ -467,24 +556,30 @@ export function ChatView({
             : uploaded.resourceType === "video"
               ? "video"
               : "file";
+        const { outText, extra } = await privacyPayload(value, {
+          viewOnce: sendViewOnce && type === "image",
+        });
         await sendMessage(
           user.uid,
           other.uid,
-          value,
+          outText,
           { url: uploaded.url, type, name: chosen.name },
           "text",
           undefined,
           reply,
+          extra,
         );
       } else {
+        const { outText, extra } = await privacyPayload(value);
         await sendMessage(
           user.uid,
           other.uid,
-          value,
+          outText,
           undefined,
           "text",
           undefined,
           reply,
+          extra,
         );
       }
 
@@ -585,6 +680,18 @@ export function ChatView({
         }
       >
 
+        {(privacy.secret || privacy.disappearMs > 0) && (
+          <div className="mx-auto mb-3 w-fit max-w-[90%] flex items-center gap-1.5 rounded-full bg-gray-100/90 px-3 py-1 text-[11px] text-gray-600">
+            {privacy.secret && <Lock size={12} />}
+            {privacy.secret && "End-to-end encrypted secret chat"}
+            {privacy.secret && privacy.disappearMs > 0 && " · "}
+            {privacy.disappearMs > 0 && <Timer size={12} />}
+            {privacy.disappearMs > 0 &&
+              `Messages disappear after ${
+                DISAPPEAR_OPTIONS.find((o) => o.ms === privacy.disappearMs)?.label ?? "a while"
+              }`}
+          </div>
+        )}
         {visible.length === 0 && (
           <p className="text-center text-sm text-gray-400 mt-10">
             Say hi to {other.displayName}
@@ -717,7 +824,28 @@ export function ChatView({
                   </p>
                 ) : (
                   <>
-                    {m.mediaUrl && m.mediaType === "image" && (
+                    {m.viewOnce && m.mediaType === "image" && (
+                      <button
+                        type="button"
+                        disabled={mine || m.viewOnceOpened || !m.mediaUrl}
+                        onClick={() => {
+                          if (!user || !m.mediaUrl) return;
+                          setImageView({ url: m.mediaUrl, name: "View once photo" });
+                          void consumeViewOnce(conversationId(user.uid, other.uid), m.id);
+                        }}
+                        className={`flex items-center gap-2 px-3 py-2 text-sm font-medium ${
+                          mine ? "text-white" : "text-sky-600"
+                        }`}
+                      >
+                        <Eye size={16} />
+                        {m.viewOnceOpened || !m.mediaUrl
+                          ? "Opened"
+                          : mine
+                            ? "View once photo"
+                            : "Tap to view photo (once)"}
+                      </button>
+                    )}
+                    {!m.viewOnce && m.mediaUrl && m.mediaType === "image" && (
                       <button
                         type="button"
                         onClick={() =>
@@ -887,6 +1015,20 @@ export function ChatView({
               <span className="flex-1 text-xs text-gray-600 truncate">
                 {file.name}
               </span>
+              {file.type.startsWith("image/") && (
+                <button
+                  type="button"
+                  onClick={() => setViewOnce((v) => !v)}
+                  aria-label="View once"
+                  className={`flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium border ${
+                    viewOnce
+                      ? "bg-sky-500 text-white border-sky-500"
+                      : "bg-white text-gray-500 border-gray-200"
+                  }`}
+                >
+                  <Eye size={12} /> 1×
+                </button>
+              )}
               <button
                 onClick={clearFile}
                 aria-label="Remove attachment"
@@ -1400,6 +1542,58 @@ export function ChatView({
                 ))}
               </div>
             )}
+
+            <div className="px-4 pt-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+              Privacy & security
+            </div>
+            <button
+              onClick={() => {
+                if (!user) return;
+                void setSecretChat(conversationId(user.uid, other.uid), !privacy.secret);
+              }}
+              className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-sm text-gray-700 hover:bg-gray-50"
+            >
+              <Lock size={18} className={privacy.secret ? "text-emerald-500" : "text-gray-400"} />
+              <span className="flex-1 text-left">
+                Secret chat (end-to-end encrypted)
+                <span className="block text-[11px] text-gray-400">
+                  New messages are locked on your devices. Calls are always encrypted end-to-end.
+                </span>
+              </span>
+              <span
+                className={`w-10 h-6 rounded-full p-0.5 transition ${
+                  privacy.secret ? "bg-emerald-500" : "bg-gray-200"
+                }`}
+              >
+                <span
+                  className={`block w-5 h-5 rounded-full bg-white shadow transition ${
+                    privacy.secret ? "translate-x-4" : ""
+                  }`}
+                />
+              </span>
+            </button>
+            <div className="px-4 py-2">
+              <div className="flex items-center gap-3 text-sm text-gray-700 mb-2">
+                <Timer size={18} className="text-gray-400" /> Disappearing messages
+              </div>
+              <div className="flex flex-wrap gap-2 pl-8">
+                {DISAPPEAR_OPTIONS.map((o) => (
+                  <button
+                    key={o.ms}
+                    onClick={() =>
+                      user && void setDisappearTimer(conversationId(user.uid, other.uid), o.ms)
+                    }
+                    className={`px-3 py-1 rounded-full text-xs border ${
+                      privacy.disappearMs === o.ms
+                        ? "border-sky-400 bg-sky-50 text-sky-700"
+                        : "border-gray-100 bg-gray-50 text-gray-600"
+                    }`}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+            </div>
 
             <button
               onClick={() => {
