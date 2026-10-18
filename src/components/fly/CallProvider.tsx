@@ -698,14 +698,16 @@ export function CallProvider({ children }: { children: ReactNode }) {
         });
 
         const pc = await buildPeer(type, "caller", callId);
+        // Start receiving the callee's candidates before the offer even goes out.
+        listenRemoteCandidates(callId, "callee");
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        await waitForIceGathering(pc);
+        // Trickle ICE sends the rest of the candidates; only wait briefly.
+        await waitForIceGathering(pc, 800);
         const localOffer = pc.localDescription ?? offer;
         await updateDoc(callRef(callId), {
           offer: { type: localOffer.type, sdp: localOffer.sdp },
         });
-        listenRemoteCandidates(callId, "callee");
 
         unsubsRef.current.push(
           watchCall(callId, (data) => {
@@ -751,6 +753,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
     [user, profile, buildPeer, listenRemoteCandidates, teardown],
   );
 
+  /** Load relay servers once at sign-in so no call waits for them later. */
+  useEffect(() => {
+    if (user) void ensureIceServers();
+  }, [user]);
+
   /* ---------------- incoming listener ---------------- */
   const phaseRef = useRef<Phase>(phase);
   useEffect(() => {
@@ -792,6 +799,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
         type: data.type,
         connectedAt: null,
       };
+      // Warm up relay servers while ringing so "Receive" connects instantly.
+      void ensureIceServers();
       setRole("callee");
       setPhase("incoming");
       setCall(data);
@@ -821,15 +830,16 @@ export function CallProvider({ children }: { children: ReactNode }) {
       const pc = await buildPeer(call.type, "callee", call.id);
       await pc.setRemoteDescription(new RTCSessionDescription(call.offer));
       appliedOfferRef.current = call.offer.sdp ?? null;
+      listenRemoteCandidates(call.id, "caller");
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await waitForIceGathering(pc);
+      // Send the answer right away; remaining candidates trickle in after.
+      await waitForIceGathering(pc, 300);
       const localAnswer = pc.localDescription ?? answer;
       await updateDoc(callRef(call.id), {
         answer: { type: localAnswer.type, sdp: localAnswer.sdp },
         status: "accepted",
       });
-      listenRemoteCandidates(call.id, "caller");
       await flushCandidates();
       unsubsRef.current.push(
         watchCall(call.id, (live) => {
@@ -852,7 +862,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
                 );
                 const fresh = await current.createAnswer();
                 await current.setLocalDescription(fresh);
-                await waitForIceGathering(current);
+                await waitForIceGathering(current, 500);
                 const localAnswer = current.localDescription ?? fresh;
                 await updateDoc(callRef(call.id), {
                   answer: { type: localAnswer.type, sdp: localAnswer.sdp },
