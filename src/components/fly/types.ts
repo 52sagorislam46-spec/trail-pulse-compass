@@ -100,6 +100,12 @@ export interface ChatMessage {
   deletedFor: string[];
   deleted: boolean;
   reactions?: Record<string, string>;
+  /** End-to-end encrypted payload (secret chat). */
+  enc?: { iv: string; ct: string };
+  /** Epoch ms after which the message disappears. */
+  expiresAt?: number;
+  viewOnce?: boolean;
+  viewOnceOpened?: boolean;
 }
 
 
