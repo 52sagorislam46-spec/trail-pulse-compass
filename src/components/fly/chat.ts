@@ -121,6 +121,7 @@ export async function sendMessage(
   kind: "text" | "call" = "text",
   postId?: string,
   reply?: { id: string; text: string; senderId: string },
+  extra?: Record<string, unknown>,
 ) {
   const id = await ensureConversation(meId, otherId);
   // Blocked conversations cannot receive new messages from either side.
@@ -148,9 +149,12 @@ export async function sendMessage(
     deletedFor: [],
     deleted: false,
     createdAt: serverTimestamp(),
+    ...(extra ?? {}),
   });
 
   const preview =
+    (extra?.["enc"] ? "🔒 Encrypted message" : "") ||
+    (extra?.["viewOnce"] ? "📷 View once photo" : "") ||
     text ||
     (media?.type === "video" ? "Video" : media?.type === "image" ? "Photo" : media ? "File" : "");
   await setDoc(
